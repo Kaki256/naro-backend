@@ -1,8 +1,6 @@
 package main
 
 import (
-	"database/sql"
-	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -11,27 +9,24 @@ import (
 
 	"github.com/go-sql-driver/mysql"
 	"github.com/jmoiron/sqlx"
+	"github.com/joho/godotenv"
+	"github.com/labstack/echo-contrib/session"
 	"github.com/labstack/echo/v4"
-)
-
-type City struct {
-	ID          int    `json:"id,omitempty"  db:"ID"`
-	Name        string `json:"name,omitempty"  db:"Name"`
-	CountryCode string `json:"countryCode,omitempty"  db:"CountryCode"`
-	District    string `json:"district,omitempty"  db:"District"`
-	Population  int    `json:"population,omitempty"  db:"Population"`
-}
-
-var (
-	db *sqlx.DB
+	"github.com/labstack/echo/v4/middleware"
+	"github.com/srinathgs/mysqlstore"
+	"github.com/traPtitech/naro-template-backend/handler"
 )
 
 func main() {
-	jst, err := time.LoadLocation("Asia/Tokyo")
+	err := godotenv.Load(".env")
 	if err != nil {
 		log.Fatal(err)
 	}
 
+	jst, err := time.LoadLocation("Asia/Tokyo")
+	if err != nil {
+		log.Fatal(err)
+	}
 	conf := mysql.Config{
 		User:      os.Getenv("DB_USERNAME"),
 		Passwd:    os.Getenv("DB_PASSWORD"),
@@ -43,54 +38,47 @@ func main() {
 		Loc:       jst,
 	}
 
-	_db, err := sqlx.Open("mysql", conf.FormatDSN())
-
+	db, err := sqlx.Open("mysql", conf.FormatDSN())
 	if err != nil {
 		log.Fatal(err)
 	}
 	fmt.Println("connected")
-	db = _db
 
+	_, err = db.Exec("CREATE TABLE IF NOT EXISTS users (Username VARCHAR(255) PRIMARY KEY, HashedPass VARCHAR(255))")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	store, err := mysqlstore.NewMySQLStoreFromConnection(db.DB, "sessions", "/", 60*60*24*14, []byte("secret-token"))
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	h := handler.NewHandler(db)
 	e := echo.New()
+	e.Use(middleware.Logger())
+	e.Use(session.Middleware(store))
+	e.Use(middleware.CORSWithConfig(middleware.CORSConfig{
+		AllowOrigins: []string{"http://localhost:5173"},
+		AllowMethods: []string{http.MethodGet, http.MethodPost},
+	}))
 
-	e.GET("/cities/:cityName", getCityInfoHandler)
-	e.POST("/cities", postCityHandler)
+	e.POST("/signup", h.SignUpHandler)
+	e.POST("/login", h.LoginHandler)
+	e.GET("/ping", func(c echo.Context) error { return c.String(http.StatusOK, "pong") })
 
-	e.Start(":8080")
-}
+	// e.GET("/cities/:cityName", h.GetCityInfoHandler)
+	// e.POST("/cities", h.PostCityHandler)
+	withAuth := e.Group("")
+	withAuth.Use(handler.UserAuthMiddleware)
+	withAuth.GET("/me", handler.GetMeHandler)
+	withAuth.GET("/cities/:cityName", h.GetCityInfoHandler)
+	withAuth.GET("/countries/all", h.GetAllCountriesHandler)
+	withAuth.POST("/cities", h.PostCityHandler)
+	withAuth.GET("/cities/all", h.GetAllCityHandler)
 
-func getCityInfoHandler(c echo.Context) error {
-	cityName := c.Param("cityName")
-	fmt.Println(cityName)
-
-	var city City
-	err := db.Get(&city, "SELECT * FROM city WHERE Name=?", cityName)
-	if errors.Is(err, sql.ErrNoRows) {
-		return echo.NewHTTPError(http.StatusNotFound, fmt.Sprintf("No such city Name = %s", cityName))
-	}
+	err = e.Start(":8080")
 	if err != nil {
-		log.Printf("DB Error: %s", err)
-		return echo.NewHTTPError(http.StatusInternalServerError, "internal server error")
+		log.Fatal(err)
 	}
-
-	return c.JSON(http.StatusOK, city)
-}
-
-func postCityHandler(c echo.Context) error {
-	var city City
-	err := c.Bind(&city)
-	if err != nil {
-		return echo.NewHTTPError(http.StatusBadRequest, "bad request body")
-	}
-
-	result, err := db.Exec("INSERT INTO city (Name, CountryCode, District, Population) VALUES (?, ?, ?, ?)", city.Name, city.CountryCode, city.District, city.Population)
-	if err != nil {
-		log.Printf("DB Error: %s", err)
-		return echo.NewHTTPError(http.StatusInternalServerError, "internal server error")
-	}
-
-	id, _ := result.LastInsertId()
-	city.ID = int(id)
-
-	return c.JSON(http.StatusCreated, city)
 }
